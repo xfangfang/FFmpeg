@@ -244,6 +244,10 @@ int av_cpu_count(void)
     nb_cpus = sysinfo.dwNumberOfProcessors;
 #endif
 
+#ifdef __vita__
+    nb_cpus = 4;
+#endif
+
     if (!atomic_exchange_explicit(&printed, 1, memory_order_relaxed))
         av_log(NULL, AV_LOG_DEBUG, "detected %d logical cores\n", nb_cpus);
 
