@@ -95,13 +95,40 @@
 #  define lseek(f,p,w) lseek64((f), (p), (w))
 #endif
 
+#ifdef __vita__
+#include <string.h>
+#endif
+
 static inline int is_dos_path(const char *path)
 {
+    int ret = 0;
+
+#ifdef __vita__
+    // https://github.com/TheOfficialFloW/VitaShell/blob/master/file.c
+    const char devs[][6] = {
+        "gro0:", "grw0:", "imc0:", "os0:", "pd0:",
+        "sa0:", "sd0:", "tm0:", "ud0:", "uma0:",
+        "ur0:", "ux0:", "vd0:", "vs0:", "xmc0:", "host0:",
+    };
+
+    const char *sep = memchr(path, ':', 6);
+    if (sep) {
+        size_t max_len = sep - path;
+        for (int i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
+            if (!strncmp(path, devs[i], max_len)) {
+                ret = 1;
+                break;
+            }
+        }
+    }
+#endif
+
 #if HAVE_DOS_PATHS
     if (path[0] && path[1] == ':')
         return 1;
 #endif
-    return 0;
+
+    return ret;
 }
 
 #if defined(_WIN32)
