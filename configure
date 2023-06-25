@@ -3265,6 +3265,8 @@ av1_amf_encoder_deps="amf"
 # vita hardware decoders
 aac_vita_decoder_deps="vita_audiodec"
 mp3_vita_decoder_deps="vita_audiodec"
+h264_vita_decoder_deps="vita_videodec"
+h264_vita_decoder_select="h264_mp4toannexb_bsf"
 
 # parsers
 aac_parser_select="adts_header mpeg4audio"

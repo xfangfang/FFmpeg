@@ -177,16 +177,13 @@ static int h264_mp4toannexb_filter(AVBSFContext *ctx, AVPacket *opkt)
     uint64_t out_size;
     int ret;
 
+    // avoid redundant packet allocations when filtering a raw h264 stream
+    if (!s->extradata_parsed)
+        return ff_bsf_get_packet_ref(ctx, opkt);
+
     ret = ff_bsf_get_packet(ctx, &in);
     if (ret < 0)
         return ret;
-
-    /* nothing to filter */
-    if (!s->extradata_parsed) {
-        av_packet_move_ref(opkt, in);
-        av_packet_free(&in);
-        return 0;
-    }
 
     buf_end  = in->data + in->size;
 
