@@ -819,6 +819,10 @@ extern const FFCodec ff_libxavs2_encoder;
 extern const FFCodec ff_libxvid_encoder;
 extern const FFCodec ff_libzvbi_teletext_decoder;
 
+/* vita */
+extern const FFCodec ff_aac_vita_decoder;
+extern const FFCodec ff_mp3_vita_decoder;
+
 /* text */
 extern const FFCodec ff_bintext_decoder;
 extern const FFCodec ff_xbin_decoder;

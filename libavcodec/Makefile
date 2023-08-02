@@ -970,6 +970,10 @@ OBJS-$(CONFIG_ADPCM_YAMAHA_DECODER)       += adpcm.o adpcm_data.o
 OBJS-$(CONFIG_ADPCM_YAMAHA_ENCODER)       += adpcmenc.o adpcm_data.o
 OBJS-$(CONFIG_ADPCM_ZORK_DECODER)         += adpcm.o adpcm_data.o
 
+# vita
+OBJS-$(CONFIG_AAC_VITA_DECODER)           += vitadec_audio.o
+OBJS-$(CONFIG_MP3_VITA_DECODER)           += vitadec_audio.o
+
 # hardware accelerators
 OBJS-$(CONFIG_D3D11VA)                    += dxva2.o
 OBJS-$(CONFIG_DXVA2)                      += dxva2.o

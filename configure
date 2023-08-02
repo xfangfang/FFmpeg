@@ -3262,6 +3262,10 @@ av1_qsv_encoder_select="qsvenc"
 av1_qsv_encoder_deps="libvpl"
 av1_amf_encoder_deps="amf"
 
+# vita hardware decoders
+aac_vita_decoder_deps="vita_audiodec"
+mp3_vita_decoder_deps="vita_audiodec"
+
 # parsers
 aac_parser_select="adts_header mpeg4audio"
 av1_parser_select="cbs_av1"
