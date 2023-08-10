@@ -50,7 +50,7 @@ typedef struct VitaDecodeContextImpl {
     unsigned int flags;
     SceAudiodecCtrl ctrl;
     SceAudiodecInfo info;
-    SceUID buffer_mb;
+    SceUID memblock;
 } VitaDecodeContextImpl;
 
 typedef struct VitaDecodeContext {
@@ -113,7 +113,7 @@ static void do_cleanup(AVCodecContext *avctx)
     if (ctx->flags & VITA_DECODE_AUDIO_CTX_FLAG_INIT_LIB)
         sceAudiodecTermLibrary(ctx->policy->type);
     if (ctx->flags & VITA_DECODE_AUDIO_CTX_FLAG_INIT_BUFFER)
-        sceKernelFreeMemBlock(ctx->buffer_mb);
+        sceKernelFreeMemBlock(ctx->memblock);
 
     memset(ctx, 0, sizeof(VitaDecodeContextImpl));
 }
@@ -188,7 +188,7 @@ static void do_init(AVCodecContext *avctx, VitaDecodeInputBuffer *buffer)
     buf_input = FFALIGN(ctx->ctrl.maxEsSize, SCE_AUDIODEC_ALIGNMENT_SIZE);
     buf_output = FFALIGN(ctx->ctrl.maxPcmSize, SCE_AUDIODEC_ALIGNMENT_SIZE);
     buf_size = buf_input + buf_output;
-    if (!do_alloc_buffer(buf_size, &ctx->buffer_mb, &ptr_buf)) {
+    if (!do_alloc_buffer(buf_size, &ctx->memblock, &ptr_buf)) {
         av_log(avctx, AV_LOG_ERROR, "vita_%s init: alloc failed\n", ctx->policy->name);
         goto bail;
     }

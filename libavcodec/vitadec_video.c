@@ -39,17 +39,20 @@ typedef struct VitaDecodeFormatDescriptor {
 
 typedef struct VitaDecodeContextImpl {
     int flags;
+
     int frame_width;
     int frame_height;
     int frame_pitch;
     const VitaDecodeFormatDescriptor *frame_format;
-    SceUID decode_mb;
-    SceUID output_mb;
-    void *output_ptr;
-    SceAvcdecCtrl decoder;
+
+    SceUID decoder_mb_frame;
+    SceUID decoder_mb_output;
+    void *decoder_ptr_output;
+    SceAvcdecCtrl decoder_ctrl;
+
     int h264_width;
     int h264_height;
-    int h264_ref_frame_count;
+    int h264_ref_frames;
 } VitaDecodeContextImpl;
 
 typedef struct VitaDecodeContext {
@@ -84,16 +87,16 @@ static void do_uninit_decoder(AVCodecContext *avctx)
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_DECODER) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_DECODER;
-        sceAvcdecDeleteDecoder(&ctx->decoder);
-        memset(&ctx->decoder, 0, sizeof(SceAvcdecCtrl));
+        sceAvcdecDeleteDecoder(&ctx->decoder_ctrl);
+        memset(&ctx->decoder_ctrl, 0, sizeof(SceAvcdecCtrl));
     }
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE;
-        sceKernelFreeMemBlock(ctx->decode_mb);
+        sceKernelFreeMemBlock(ctx->decoder_mb_frame);
     }
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT;
-        sceKernelFreeMemBlock(ctx->output_mb);
+        sceKernelFreeMemBlock(ctx->decoder_mb_output);
     }
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
@@ -200,13 +203,13 @@ static bool do_update_dimension(AVCodecContext *avctx, H264ParamSets *ps)
 
     if (ctx->h264_width == avctx->width 
         && ctx->h264_height == avctx->height
-        && ctx->h264_ref_frame_count == sps->ref_frame_count
+        && ctx->h264_ref_frames == sps->ref_frame_count
         && ctx->frame_format == desc)
         return false;
 
     ctx->h264_width = avctx->width;
     ctx->h264_height = avctx->height;
-    ctx->h264_ref_frame_count = sps->ref_frame_count;
+    ctx->h264_ref_frames = sps->ref_frame_count;
 
     // https://github.com/MakiseKurisu/vita-sceVideodecInitLibrary-test
     ctx->frame_width = FFMAX(FFALIGN(avctx->width, 16), 64);
@@ -377,7 +380,7 @@ static void do_init(AVCodecContext *avctx)
     init.size = sizeof(SceVideodecQueryInitInfoHwAvcdec);
     init.horizontal = ctx->frame_width;
     init.vertical = ctx->frame_height;
-    init.numOfRefFrames = ctx->h264_ref_frame_count;
+    init.numOfRefFrames = ctx->h264_ref_frames;
     init.numOfStreams = 1;
     ret = sceVideodecInitLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC, &init);
     if (ret != 0) {
@@ -388,7 +391,7 @@ static void do_init(AVCodecContext *avctx)
 
     qdi.horizontal = init.horizontal;
     qdi.vertical = init.vertical;
-    qdi.numOfRefFrames = ctx->h264_ref_frame_count;
+    qdi.numOfRefFrames = ctx->h264_ref_frames;
     ret = sceAvcdecQueryDecoderMemSize(SCE_VIDEODEC_TYPE_HW_AVCDEC, &qdi, &di);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: query mem size failed 0x%x\n", ret);
@@ -397,7 +400,7 @@ static void do_init(AVCodecContext *avctx)
 
 
     decode_buf_size = FFALIGN(di.frameMemSize, VITA_MEM_BLOCK_SIZE_ALIGN);
-    if (!alloc_vram(decode_buf_size, VITA_DECODE_BUFF_ADDR_ALIGN, &ctx->decode_mb, &buf_decode_ptr)) {
+    if (!alloc_vram(decode_buf_size, VITA_DECODE_BUFF_ADDR_ALIGN, &ctx->decoder_mb_frame, &buf_decode_ptr)) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc decode buffer failed\n");
         goto bail;
     }
@@ -410,15 +413,15 @@ static void do_init(AVCodecContext *avctx)
     }
 
     ouput_buf_size = FFALIGN(ouput_buf_size, VITA_MEM_BLOCK_SIZE_ALIGN);
-    if (!alloc_vram(ouput_buf_size, 0, &ctx->output_mb, &ctx->output_ptr)) {
+    if (!alloc_vram(ouput_buf_size, 0, &ctx->decoder_mb_output, &ctx->decoder_ptr_output)) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc output buffer failed\n");
         goto bail;
     }
     ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT;
 
-    ctx->decoder.frameBuf.pBuf = buf_decode_ptr;
-    ctx->decoder.frameBuf.size = decode_buf_size;
-    ret = sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctx->decoder, &qdi);
+    ctx->decoder_ctrl.frameBuf.pBuf = buf_decode_ptr;
+    ctx->decoder_ctrl.frameBuf.size = decode_buf_size;
+    ret = sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctx->decoder_ctrl, &qdi);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: create decoder failed: 0x%x\n", ret);
         goto bail;
@@ -454,7 +457,7 @@ static void vita_flush(AVCodecContext *avctx)
     if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY))
         return;
 
-    sceAvcdecDecodeFlush(&ctx->decoder);
+    sceAvcdecDecodeFlush(&ctx->decoder_ctrl);
 }
 
 static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPicture *p)
@@ -475,7 +478,7 @@ static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPict
     av_image_fill_max_pixsteps(max_steps, NULL, desc);
     crop_x = FFMIN(p->frame.frameCropLeftOffset, p->frame.framePitch - ctx->h264_width);
     crop_y = FFMIN(p->frame.frameCropTopOffset, p->frame.frameHeight - ctx->h264_height);
-    pixels = (uint8_t*) ctx->output_ptr + (crop_x + crop_y * p->frame.framePitch) * max_steps[0];
+    pixels = (uint8_t*) ctx->decoder_ptr_output + (crop_x + crop_y * p->frame.framePitch) * max_steps[0];
 
     ret = av_image_fill_arrays(src_list, ls_list,
         pixels, avctx->pix_fmt, 
@@ -527,13 +530,13 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     p.frame.framePitch = ctx->frame_pitch;
     p.frame.frameWidth = ctx->frame_width;
     p.frame.frameHeight = ctx->frame_height;
-    p.frame.pPicture[0] = ctx->output_ptr;
+    p.frame.pPicture[0] = ctx->decoder_ptr_output;
 
     ap.numOfElm = 1;
     ap.pPicture = pp;
 
     if (!avpkt->size) {
-        ret = sceAvcdecDecodeStop(&ctx->decoder, &ap);
+        ret = sceAvcdecDecodeStop(&ctx->decoder_ctrl, &ap);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: flush failed 0x%x\n", ret);
             return AVERROR_UNKNOWN;
@@ -547,7 +550,7 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
         au.es.pBuf = avpkt->data;
         au.es.size = avpkt->size;
 
-        ret = sceAvcdecDecode(&ctx->decoder, &au, &ap);
+        ret = sceAvcdecDecode(&ctx->decoder_ctrl, &au, &ap);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: decode failed 0x%x\n", ret);
             return AVERROR_UNKNOWN;
