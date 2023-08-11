@@ -21,6 +21,7 @@
 #include "libavutil/imgutils.h"
 
 // non-exported internal API
+
 typedef struct SceVideodecCtrl {
     uint8_t reserved[24];
     SceUIntVAddr vaddr;
@@ -48,22 +49,76 @@ SceInt32 sceAvcdecCreateDecoderInternal(SceVideodecType type, SceAvcdecCtrl *dec
 SceInt32 sceAvcdecDecodeAuInternal(SceAvcdecCtrl *decoder, SceAvcdecAu *au, SceInt32 *pic);
 SceInt32 sceAvcdecDecodeGetPictureWithWorkPictureInternal(SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *a1, SceAvcdecArrayPicture *a2, SceInt32 *pic);
 
+// | Frame | Output | Codec | Time-NoCopy | Time-CopyOut |
+// |-------|--------|-------|-------------|--------------|
+// | CDRAM | CDRAM  | CDRAM | 2.419       | 3.686        |
+// | PHY   | PHY    | PHY   | 2.747       | 2.917        |
+// | PHY   | CDRAM  | CDRAM | 2.556       | 4.343        |
+// | CDRAM | PHY    | CDRAM | 2.460       | 2.936        |
+// | CDRAM | CDRAM  | PHY   | 2.467       | 3.733        |
+//
+// These buffers can be allocated in either PHY or CDRAM memory. 
+// The sample is a 20-second 540x360 mp4, which has 200 packets.
+//
+// Although PHY memory can improve performance a little bit, 
+// it is too scarce (only 26MB available) to hold all buffers 
+// in high resolution video decoding, so CDRAM is a better choice.
+
+#define VITA_DECODE_MEM_BLOCK_NAME              "ffmpeg_vdec"
+#define VITA_DECODE_MEM_BLOCK_TYPE              SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW
+#define VITA_DECODE_MEM_BLOCK_SIZE_ALIGN        (256 * 1024)
+#define VITA_DECODE_VOID_TIMESTAMP              (0xffffffff)
 
 #define VITA_DECODE_VIDEO_FLAG_INIT_POSTPONED           1
 #define VITA_DECODE_VIDEO_FLAG_DECODER_READY            (1 << 1)
 #define VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB             (1 << 2)
 #define VITA_DECODE_VIDEO_FLAG_DONE_DECODER             (1 << 3)
-#define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE       (1 << 4)
+#define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_FRAME        (1 << 4)
 #define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT       (1 << 5)
 #define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_MB     (1 << 6)
 #define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_UNMAP  (1 << 7)
 #define VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_VADDR  (1 << 8)
+
+enum VitaDecodeBufferType {
+    VITA_DECODE_BUFFER_TYPE_FRAME,
+    VITA_DECODE_BUFFER_TYPE_OUTPUT,
+    VITA_DECODE_BUFFER_TYPE_CODEC_MEM,
+    VITA_DECODE_BUFFER_TYPE_CODEC_UNMAP,
+    VITA_DECODE_BUFFER_TYPE_CODEC_VADDR,
+    VITA_DECODE_BUFFER_TYPE_NB,
+};
 
 typedef struct VitaDecodeFormatDescriptor {
     enum AVPixelFormat ff_format;
     SceAvcdecPixelFormat sce_format;
     int pitch_alignment;
 } VitaDecodeFormatDescriptor;
+
+typedef struct VitaDecodeBufferAllocParams {
+    SceUID *mb;
+    void *ptr;
+    void *ref;
+    int size;
+    int alignment;
+} VitaDecodeBufferAllocParams;
+
+typedef struct VitaDecodeBufferFreeParams {
+    SceUID *mb;
+    void *ptr;
+    void *ref;
+} VitaDecodeBufferFreeParams;
+
+typedef struct VitaDecodeBufferDescriptor {
+    bool (*alloc)(VitaDecodeBufferAllocParams *p);
+    void (*free)(VitaDecodeBufferFreeParams *p);
+    const char *name;
+    int field_bit;
+    int offset_mb;
+    int offset_ptr;
+    int offset_ref;
+    int alignment_addr;
+    int alignment_size;
+} VitaDecodeBufferDescriptor;
 
 typedef struct VitaDecodeContextImpl {
     int flags;
@@ -78,6 +133,7 @@ typedef struct VitaDecodeContextImpl {
     SceUID decoder_mb_codec_mem;
     SceUID decoder_mb_codec_unmap;
     SceUIntVAddr decoder_vaddr_codec;
+    void *decoder_ptr_codec_mem;
     void *decoder_ptr_output;
     int decoder_picture_int;
     SceAvcdecCtrl decoder_ctrl;
@@ -92,15 +148,17 @@ typedef struct VitaDecodeContext {
     VitaDecodeContextImpl impl;
 } VitaDecodeContext;
 
-#define VITA_MEM_BLOCK_NAME             "ffmpeg_vdec"
-#define VITA_MEM_BLOCK_TYPE             SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW
-#define VITA_MEM_BLOCK_SIZE_ALIGN       (256 * 1024)
 
-#define VITA_DECODE_BUFF_ADDR_ALIGN     (1024 * 1024)
-#define VITA_DECODE_ALIGN_CODEC_SIZE    (1024 * 1024)
-#define VITA_DECODE_ALIGN_CODEC_ADDR    (1024 * 1024)
-#define VITA_DECODE_ALIGN_CODEC_VADDR   (256 * 1024)
-#define VITA_DECODE_VOID_TIMESTAMP      (0xffffffff)
+static bool do_mem_alloc(VitaDecodeBufferAllocParams *p);
+static void do_mem_free(VitaDecodeBufferFreeParams *p);
+static bool do_unmap_open(VitaDecodeBufferAllocParams *p);
+static void do_unmap_close(VitaDecodeBufferFreeParams *p);
+static bool do_vaddr_alloc(VitaDecodeBufferAllocParams *p);
+static void do_vaddr_free(VitaDecodeBufferFreeParams *p);
+
+static void do_init(AVCodecContext *avctx);
+static void buffers_free(AVCodecContext *avctx);
+
 
 static const VitaDecodeFormatDescriptor vita_decode_format_descriptors[] = {
     { AV_PIX_FMT_RGBA, SCE_AVCDEC_PIXELFORMAT_RGBA8888, 16 },
@@ -110,7 +168,141 @@ static const VitaDecodeFormatDescriptor vita_decode_format_descriptors[] = {
     { AV_PIX_FMT_NV12, SCE_AVCDEC_PIXELFORMAT_YUV420_PACKED_RASTER, 16 },
 };
 
-static void do_init(AVCodecContext *avctx);
+static const VitaDecodeBufferDescriptor vita_decode_buffer_descriptors[VITA_DECODE_BUFFER_TYPE_NB] = {
+    [VITA_DECODE_BUFFER_TYPE_FRAME] = {
+        do_mem_alloc,
+        do_mem_free,
+        "frame",
+        VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_FRAME,
+        offsetof(VitaDecodeContextImpl, decoder_mb_frame),
+        0,
+        0,
+        (1024 * 1024),
+        0,
+    },
+
+    [VITA_DECODE_BUFFER_TYPE_OUTPUT] = {
+        do_mem_alloc,
+        do_mem_free,
+        "output",
+        VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT,
+        offsetof(VitaDecodeContextImpl, decoder_mb_output),
+        offsetof(VitaDecodeContextImpl, decoder_ptr_output),
+        0,
+        0,
+        0,
+    },
+
+    [VITA_DECODE_BUFFER_TYPE_CODEC_MEM] = {
+        do_mem_alloc,
+        do_mem_free,
+        "codec_mb",
+        VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_MB,
+        offsetof(VitaDecodeContextImpl, decoder_mb_codec_mem),
+        offsetof(VitaDecodeContextImpl, decoder_ptr_codec_mem),
+        0,
+        (1024 * 1024),
+        (1024 * 1024),
+    },
+
+    [VITA_DECODE_BUFFER_TYPE_CODEC_UNMAP] = {
+        do_unmap_open,
+        do_unmap_close,
+        "codec_unmap",
+        VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_UNMAP,
+        offsetof(VitaDecodeContextImpl, decoder_mb_codec_unmap),
+        0,
+        offsetof(VitaDecodeContextImpl, decoder_ptr_codec_mem),
+        0,
+        (1024 * 1024),
+    },
+
+    [VITA_DECODE_BUFFER_TYPE_CODEC_VADDR] = {
+        do_vaddr_alloc,
+        do_vaddr_free,
+        "codec_vaddr",
+        VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_VADDR,
+        0,
+        offsetof(VitaDecodeContextImpl, decoder_vaddr_codec),
+        offsetof(VitaDecodeContextImpl, decoder_mb_codec_unmap),
+        0,
+        (256 * 1024),
+    },
+};
+
+
+static bool do_mem_alloc(VitaDecodeBufferAllocParams *p)
+{
+    SceUID mb = -1;
+    void *ptr = NULL;
+    SceUID *out_mb = p->mb;
+    void **out_ptr = p->ptr;
+    SceKernelAllocMemBlockOpt opt = {0};
+    SceKernelAllocMemBlockOpt *arg = NULL;
+
+    if (p->alignment) {
+        arg = &opt;
+        arg->size = sizeof(SceKernelAllocMemBlockOpt);
+        arg->attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+        arg->alignment = p->alignment;
+    }
+
+    p->size = FFALIGN(p->size, VITA_DECODE_MEM_BLOCK_SIZE_ALIGN);
+    mb = sceKernelAllocMemBlock(VITA_DECODE_MEM_BLOCK_NAME, VITA_DECODE_MEM_BLOCK_TYPE, p->size, arg);
+    if (mb < 0)
+        goto fail;
+
+    if (sceKernelGetMemBlockBase(mb, &ptr) != 0)
+        goto fail;
+
+    *out_mb = mb;
+    *out_ptr = ptr;
+    return true;
+
+fail:
+    if (mb >= 0)
+        sceKernelFreeMemBlock(mb);
+    return false;
+}
+
+static void do_mem_free(VitaDecodeBufferFreeParams *p)
+{
+    sceKernelFreeMemBlock(*p->mb);
+}
+
+static bool do_unmap_open(VitaDecodeBufferAllocParams *p)
+{
+    void **mem_base = p->ref;
+    int mb = sceCodecEngineOpenUnmapMemBlock(*mem_base, p->size);
+    if (mb <= 0)
+        return false;
+    *p->mb = mb;
+    return true;
+}
+
+static void do_unmap_close(VitaDecodeBufferFreeParams *p)
+{
+    sceCodecEngineCloseUnmapMemBlock(*p->mb);
+}
+
+static bool do_vaddr_alloc(VitaDecodeBufferAllocParams *p)
+{
+    SceUID *unmap = p->ref;
+    SceUIntVAddr *vaddr = p->ptr;
+    SceUIntVAddr ret = sceCodecEngineAllocMemoryFromUnmapMemBlock(*unmap, p->size, p->alignment);
+    if (!ret)
+        return false;
+    *vaddr = ret;
+    p->ptr = NULL;  // don't export it as void pointer
+    return true;
+}
+
+static void do_vaddr_free(VitaDecodeBufferFreeParams *p)
+{
+    SceUID *unmap = p->ref;
+    SceUIntVAddr *vaddr = p->ptr;
+    sceCodecEngineFreeMemoryFromUnmapMemBlock(*unmap, *vaddr);
+}
 
 static VitaDecodeContextImpl *get_ctx_impl(AVCodecContext *avctx)
 {
@@ -125,31 +317,11 @@ static void do_uninit_decoder(AVCodecContext *avctx)
         sceAvcdecDeleteDecoder(&ctx->decoder_ctrl);
         memset(&ctx->decoder_ctrl, 0, sizeof(SceAvcdecCtrl));
     }
-    if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE) {
-        ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE;
-        sceKernelFreeMemBlock(ctx->decoder_mb_frame);
-    }
-    if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT) {
-        ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT;
-        sceKernelFreeMemBlock(ctx->decoder_mb_output);
-    }
-    if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_VADDR) {
-        ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_VADDR;
-        sceCodecEngineFreeMemoryFromUnmapMemBlock(ctx->decoder_mb_codec_unmap, ctx->decoder_vaddr_codec);
-    }
-    if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_UNMAP) {
-        ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_UNMAP;
-        sceCodecEngineCloseUnmapMemBlock(ctx->decoder_mb_codec_unmap);
-    }
-    if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_MB) {
-        ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_MB;
-        sceKernelFreeMemBlock(ctx->decoder_mb_codec_mem);
-    }
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
         sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
     }
-
+    buffers_free(avctx);
     ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DECODER_READY;
 }
 
@@ -160,37 +332,61 @@ static void do_cleanup(AVCodecContext *avctx)
     memset(ctx, 0, sizeof(VitaDecodeContextImpl));
 }
 
-static bool alloc_vram(size_t size, size_t align, SceUID *out_mb, void **out_ptr)
+static void extract_buffer_field_ptrs(const VitaDecodeBufferDescriptor *bd, void *ctx, SceUID **mb, void **ptr, void **ref)
 {
-    int ret = 0;
-    SceUID mb = -1;
-    void *ptr = NULL;
+    if (bd->offset_mb)
+        *mb = (SceUID*) ((uint8_t*) ctx + bd->offset_mb);
+    if (bd->offset_ptr)
+        *ptr = (void*) ((uint8_t*) ctx + bd->offset_ptr);
+    if (bd->offset_ref)
+        *ref = (void*) ((uint8_t*) ctx + bd->offset_ref);
+}
 
-    SceKernelAllocMemBlockOpt opt_args = {0};
-    SceKernelAllocMemBlockOpt *opt = NULL;
-    if (align) {
-        opt = &opt_args;
-        opt->size = sizeof(SceKernelAllocMemBlockOpt);
-        opt->attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
-        opt->alignment = align;
+static bool buffers_alloc(AVCodecContext *avctx, int *sizes, void **ptrs)
+{
+    VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
+    for (int i = 0; i < VITA_DECODE_BUFFER_TYPE_NB; i++) {
+        const VitaDecodeBufferDescriptor *bd = &vita_decode_buffer_descriptors[i];
+        SceUID dummy_out_mb = 0;
+        void *dummy_out_ptr = NULL;
+        VitaDecodeBufferAllocParams p = {0};
+        extract_buffer_field_ptrs(bd, ctx, &p.mb, &p.ptr, &p.ref);
+        p.alignment = bd->alignment_addr;
+        p.size = bd->alignment_size ? FFALIGN(sizes[i], bd->alignment_size) : sizes[i];
+        if (p.size <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid specified size for %s buffer\n", bd->name);
+            return false;
+        }
+
+        // allocator functions don't need null check when exporting results
+        if (!p.mb)
+            p.mb = &dummy_out_mb;
+        if (!p.ptr)
+            p.ptr = &dummy_out_ptr;
+
+        if (!bd->alloc(&p)) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 init: allocate %s buffer failed\n", bd->name);
+            return false;
+        }
+
+        sizes[i] = p.size;
+        ptrs[i] = p.ptr ? *((void**) p.ptr) : NULL;
+        ctx->flags |= bd->field_bit;
     }
-
-    mb = sceKernelAllocMemBlock(VITA_MEM_BLOCK_NAME, VITA_MEM_BLOCK_TYPE, size, opt);
-    if (mb < 0)
-        goto fail;
-
-    ret = sceKernelGetMemBlockBase(mb, &ptr);
-    if (ret < 0)
-        goto fail;
-
-    *out_mb = mb;
-    *out_ptr = ptr;
     return true;
+}
 
-fail:
-    if (mb >= 0)
-        sceKernelFreeMemBlock(mb);
-    return false;
+static void buffers_free(AVCodecContext *avctx)
+{
+    VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
+    for (int i = VITA_DECODE_BUFFER_TYPE_NB - 1; i >= 0; i--) {
+        const VitaDecodeBufferDescriptor *bd = &vita_decode_buffer_descriptors[i];
+        if (ctx->flags & bd->field_bit) {
+            VitaDecodeBufferFreeParams p = {0};
+            extract_buffer_field_ptrs(bd, ctx, &p.mb, &p.ptr, &p.ref);
+            bd->free(&p);
+        }
+    }
 }
 
 static const VitaDecodeFormatDescriptor* get_format_descriptor(enum AVPixelFormat fmt)
@@ -407,127 +603,86 @@ bail:
     ff_h264_ps_uninit(&ps);
 }
 
-static bool do_init_avc_lib(AVCodecContext *avctx)
+static void do_init(AVCodecContext *avctx)
 {
     int ret = 0;
-    int query_mem_size = 0;
-    int rounded_mem_size = 0;
-    void *codec_ptr = NULL;
+    int ouput_buf_size = 0;
+    int codec_buf_size = 0;
 
     SceVideodecCtrl ctrl = {0};
+    SceAvcdecDecoderInfo di = {0};
     SceVideodecQueryInitInfo init = {0};
+    SceAvcdecQueryDecoderInfo qdi = {0};
+    int sizes[VITA_DECODE_BUFFER_TYPE_NB] = {0};
+    void *ptrs[VITA_DECODE_BUFFER_TYPE_NB] = {NULL};
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
+
+    if (ctx->h264_width <= 0 || ctx->h264_height <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: unknown video width or height\n");
+        goto fail;
+    }
+
+    // the decoder may have been initialized before
+    do_uninit_decoder(avctx);
 
     init.hwAvc.size = sizeof(SceVideodecQueryInitInfoHwAvcdec);
     init.hwAvc.horizontal = ctx->frame_width;
     init.hwAvc.vertical = ctx->frame_height;
     init.hwAvc.numOfRefFrames = ctx->h264_ref_frames;
     init.hwAvc.numOfStreams = 1;
-
     sceVideodecSetConfigInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, 2);
     sceAvcdecSetDecodeMode(SCE_VIDEODEC_TYPE_HW_AVCDEC, 0x80);
-    sceVideodecQueryMemSizeInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &init, &query_mem_size);
-    if (query_mem_size <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: query codec memory size failed\n");
-        return false;
+    sceVideodecQueryMemSizeInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &init, &codec_buf_size);
+    if (codec_buf_size <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: query codec buffer size failed\n");
+        goto fail;
     }
 
-    rounded_mem_size = FFALIGN(query_mem_size, VITA_DECODE_ALIGN_CODEC_SIZE);
-    if (!alloc_vram(rounded_mem_size, VITA_DECODE_ALIGN_CODEC_ADDR, &ctx->decoder_mb_codec_mem, &codec_ptr)) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc codec buffer failed\n");
-        return false;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_MB;
-
-    ctx->decoder_mb_codec_unmap = sceCodecEngineOpenUnmapMemBlock(codec_ptr, rounded_mem_size);
-    if (ctx->decoder_mb_codec_unmap <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: open codec unmap memory failed\n");
-        return false;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_UNMAP;
-
-    ctx->decoder_vaddr_codec = sceCodecEngineAllocMemoryFromUnmapMemBlock(ctx->decoder_mb_codec_unmap, query_mem_size, VITA_DECODE_ALIGN_CODEC_VADDR);
-    if (!ctx->decoder_vaddr_codec) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc codec unmap memory failed\n");
-        return false;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_CODEC_VADDR;
-
-    ctrl.vaddr = ctx->decoder_vaddr_codec;
-    ctrl.size = query_mem_size;
-    ret = sceVideodecInitLibraryWithUnmapMemInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctrl, &init);
-    if (ret != 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: init library failed 0x%x\n", ret);
-        return false;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
-    return true;
-}
-
-static void do_init(AVCodecContext *avctx)
-{
-    int ret = 0;
-    size_t decode_buf_size = 0;
-    size_t ouput_buf_size = 0;
-    void *buf_decode_ptr = NULL;
-
-    SceAvcdecDecoderInfo di = {0};
-    SceAvcdecQueryDecoderInfo qdi = {0};
-    VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
-
-    if (ctx->h264_width <= 0 || ctx->h264_height <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: unknown video width or height\n");
-        goto bail;
-    }
-
-    // the decoder may have been initialized before
-    do_uninit_decoder(avctx);
-
-    if (!do_init_avc_lib(avctx))
-        goto bail;
-
-    qdi.horizontal = ctx->frame_width;
-    qdi.vertical = ctx->frame_height;
-    qdi.numOfRefFrames = ctx->h264_ref_frames;
+    qdi.horizontal = init.hwAvc.horizontal;
+    qdi.vertical = init.hwAvc.vertical;
+    qdi.numOfRefFrames = init.hwAvc.numOfRefFrames;
     ret = sceAvcdecQueryDecoderMemSizeInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &qdi, &di);
     if (ret != 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: query mem size failed 0x%x\n", ret);
-        goto bail;
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: query frame buffer size failed 0x%x\n", ret);
+        goto fail;
     }
-
-    decode_buf_size = FFALIGN(di.frameMemSize, VITA_MEM_BLOCK_SIZE_ALIGN);
-    if (!alloc_vram(decode_buf_size, VITA_DECODE_BUFF_ADDR_ALIGN, &ctx->decoder_mb_frame, &buf_decode_ptr)) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc decode buffer failed\n");
-        goto bail;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_DECODE;
 
     ouput_buf_size = av_image_get_buffer_size(avctx->pix_fmt, ctx->frame_width, ctx->frame_height, 1);
     if (ouput_buf_size <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid frame buffer size\n");
-        goto bail;
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid output buffer size\n");
+        goto fail;
     }
 
-    ouput_buf_size = FFALIGN(ouput_buf_size, VITA_MEM_BLOCK_SIZE_ALIGN);
-    if (!alloc_vram(ouput_buf_size, 0, &ctx->decoder_mb_output, &ctx->decoder_ptr_output)) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: alloc output buffer failed\n");
-        goto bail;
-    }
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_BUFFER_OUTPUT;
+    sizes[VITA_DECODE_BUFFER_TYPE_FRAME] = di.frameMemSize;
+    sizes[VITA_DECODE_BUFFER_TYPE_OUTPUT] = ouput_buf_size;
+    sizes[VITA_DECODE_BUFFER_TYPE_CODEC_MEM] = codec_buf_size;
+    sizes[VITA_DECODE_BUFFER_TYPE_CODEC_UNMAP] = codec_buf_size;
+    sizes[VITA_DECODE_BUFFER_TYPE_CODEC_VADDR] = codec_buf_size;
+    if (!buffers_alloc(avctx, sizes, ptrs))
+        goto fail;
 
-    ctx->decoder_ctrl.frameBuf.pBuf = buf_decode_ptr;
-    ctx->decoder_ctrl.frameBuf.size = decode_buf_size;
+    ctrl.vaddr = ctx->decoder_vaddr_codec;
+    ctrl.size = codec_buf_size;
+    ret = sceVideodecInitLibraryWithUnmapMemInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctrl, &init);
+    if (ret != 0) {
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: init library failed 0x%x\n", ret);
+        goto fail;
+    }
+    ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
+
+    ctx->decoder_ctrl.frameBuf.pBuf = ptrs[VITA_DECODE_BUFFER_TYPE_FRAME];
+    ctx->decoder_ctrl.frameBuf.size = sizes[VITA_DECODE_BUFFER_TYPE_FRAME];
     ret = sceAvcdecCreateDecoderInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctx->decoder_ctrl, &qdi);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: create decoder failed: 0x%x\n", ret);
-        goto bail;
+        goto fail;
     }
     ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_DECODER;
 
     ctx->flags |= VITA_DECODE_VIDEO_FLAG_DECODER_READY;
     return;
 
-bail:
+fail:
     do_cleanup(avctx);
 }
 
