@@ -149,6 +149,8 @@ static void do_uninit_decoder(AVCodecContext *avctx)
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
         sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
     }
+
+    ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DECODER_READY;
 }
 
 static void do_cleanup(AVCodecContext *avctx)
