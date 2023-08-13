@@ -237,13 +237,13 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     }
 
     if (ctx->ctrl.outputPcmSize) {
-        frame->nb_samples = ctx->ctrl.outputPcmSize / get_bytes_per_sample(avctx);
         ret = ff_get_buffer(avctx, frame, 0);
         if (ret < 0)
             return ret;
 
         *got_frame = 1;
         memcpy(frame->data[0], ctx->ctrl.pPcm, ctx->ctrl.outputPcmSize);
+        frame->nb_samples = ctx->ctrl.outputPcmSize / get_bytes_per_sample(avctx);
     }
 
     // consumed byte count
