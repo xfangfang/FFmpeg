@@ -19,6 +19,7 @@
 #include "libavutil/log.h"
 #include "libavutil/macros.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mathematics.h"
 
 // non-exported internal API
 
@@ -67,7 +68,8 @@ SceInt32 sceAvcdecDecodeGetPictureWithWorkPictureInternal(SceAvcdecCtrl *decoder
 #define VITA_DECODE_MEM_BLOCK_NAME              "ffmpeg_vdec"
 #define VITA_DECODE_MEM_BLOCK_TYPE              SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW
 #define VITA_DECODE_MEM_BLOCK_SIZE_ALIGN        (256 * 1024)
-#define VITA_DECODE_VOID_TIMESTAMP              (0xffffffff)
+#define VITA_DECODE_TIMESTAMP_UNIT_BASE         (90 * 1000)
+#define VITA_DECODE_TIMESTAMP_VOID              (0xffffffff)
 
 #define VITA_DECODE_VIDEO_FLAG_INIT_POSTPONED           1
 #define VITA_DECODE_VIDEO_FLAG_DECODER_READY            (1 << 1)
@@ -711,6 +713,46 @@ static void vita_flush(AVCodecContext *avctx)
     sceAvcdecDecodeFlush(&ctx->decoder_ctrl);
 }
 
+static AVRational* select_time_base(AVCodecContext *avctx)
+{
+    AVRational *base = &avctx->pkt_timebase;
+    return (base && base->num && base->den) ? base : NULL;
+}
+
+static void to_timestamp_vita(int64_t pts, AVRational *ff_base, SceVideodecTimeStamp *ts)
+{
+    int64_t result = 0;
+    if (pts == AV_NOPTS_VALUE) {
+        ts->upper = VITA_DECODE_TIMESTAMP_VOID;
+        ts->lower = VITA_DECODE_TIMESTAMP_VOID;
+        return;
+    }
+
+    if (ff_base) {
+        AVRational vita_base = av_make_q(1, VITA_DECODE_TIMESTAMP_UNIT_BASE);
+        result = av_rescale_q(pts, *ff_base, vita_base);
+    } else {
+        result = pts;
+    }
+    ts->upper = (SceUInt32) (result >> 32);
+    ts->lower = (SceUInt32) (result);
+}
+
+static int64_t to_timestamp_ff(AVRational *ff_base, SceVideodecTimeStamp *ts)
+{
+    int64_t count = 0;
+    if (ts->upper == VITA_DECODE_TIMESTAMP_VOID && ts->lower == VITA_DECODE_TIMESTAMP_VOID)
+        return AV_NOPTS_VALUE;
+
+    count = (((uint64_t) ts->upper) << 32) | ((uint64_t) ts->lower);
+    if (ff_base) {
+        AVRational vita_base = av_make_q(1, VITA_DECODE_TIMESTAMP_UNIT_BASE);
+        return av_rescale_q(count, vita_base, *ff_base);
+    } else {
+        return count;
+    }
+}
+
 static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPicture *p)
 {
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
@@ -722,6 +764,7 @@ static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPict
     uint32_t crop_x = 0;
     uint32_t crop_y = 0;
     uint8_t *pixels = NULL;
+    AVRational *time_base = select_time_base(avctx);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
     if (!desc)
         return false;
@@ -740,6 +783,8 @@ static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPict
     av_image_copy(frame->data, frame->linesize, 
         (const uint8_t**) src_list, (const int*) ls_list,
         avctx->pix_fmt, avctx->width, avctx->height);
+
+    frame->pts = to_timestamp_ff(time_base, &p->info.pts);
     return true;
 }
 
@@ -795,12 +840,11 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     } else {
         SceAvcdecAu au = {0};
         SceAvcdecArrayPicture wap = {0};
-        au.pts.upper = VITA_DECODE_VOID_TIMESTAMP;
-        au.pts.lower = VITA_DECODE_VOID_TIMESTAMP;
-        au.dts.upper = VITA_DECODE_VOID_TIMESTAMP;
-        au.dts.lower = VITA_DECODE_VOID_TIMESTAMP;
+        AVRational *time_base = select_time_base(avctx);
         au.es.pBuf = avpkt->data;
         au.es.size = avpkt->size;
+        to_timestamp_vita(avpkt->pts, time_base,  &au.pts);
+        to_timestamp_vita(avpkt->dts, time_base, &au.dts);
 
         ret = sceAvcdecDecodeAuInternal(&ctx->decoder_ctrl, &au, &ctx->decoder_picture_int);
         if (ret < 0) {
