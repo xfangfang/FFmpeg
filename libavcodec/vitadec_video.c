@@ -17,6 +17,7 @@
 #include "startcode.h"
 
 #include "libavutil/log.h"
+#include "libavutil/opt.h"
 #include "libavutil/macros.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mathematics.h"
@@ -124,6 +125,7 @@ typedef struct VitaDecodeBufferDescriptor {
 
 typedef struct VitaDecodeContextImpl {
     int flags;
+    int option_dr;
 
     int frame_width;
     int frame_height;
@@ -139,6 +141,7 @@ typedef struct VitaDecodeContextImpl {
     void *decoder_ptr_output;
     int decoder_picture_int;
     SceAvcdecCtrl decoder_ctrl;
+    AVFrame *decoder_dr_frame;
 
     int h264_width;
     int h264_height;
@@ -317,13 +320,13 @@ static void do_uninit_decoder(AVCodecContext *avctx)
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_DECODER) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_DECODER;
         sceAvcdecDeleteDecoder(&ctx->decoder_ctrl);
-        memset(&ctx->decoder_ctrl, 0, sizeof(SceAvcdecCtrl));
     }
     if (ctx->flags & VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB) {
         ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
         sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
     }
     buffers_free(avctx);
+    av_frame_free(&ctx->decoder_dr_frame);
     ctx->flags &= ~VITA_DECODE_VIDEO_FLAG_DECODER_READY;
 }
 
@@ -331,7 +334,7 @@ static void do_cleanup(AVCodecContext *avctx)
 {
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
     do_uninit_decoder(avctx);
-    memset(ctx, 0, sizeof(VitaDecodeContextImpl));
+    ctx->flags = 0;
 }
 
 static void extract_buffer_field_ptrs(const VitaDecodeBufferDescriptor *bd, void *ctx, SceUID **mb, void **ptr, void **ref)
@@ -355,10 +358,8 @@ static bool buffers_alloc(AVCodecContext *avctx, int *sizes, void **ptrs)
         extract_buffer_field_ptrs(bd, ctx, &p.mb, &p.ptr, &p.ref);
         p.alignment = bd->alignment_addr;
         p.size = bd->alignment_size ? FFALIGN(sizes[i], bd->alignment_size) : sizes[i];
-        if (p.size <= 0) {
-            av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid specified size for %s buffer\n", bd->name);
-            return false;
-        }
+        if (p.size <= 0)
+            continue;
 
         // allocator functions don't need null check when exporting results
         if (!p.mb)
@@ -605,6 +606,62 @@ bail:
     ff_h264_ps_uninit(&ps);
 }
 
+static bool prepare_dr_frame(AVCodecContext *avctx, bool check_buf)
+{
+    VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
+    if (!ctx->decoder_dr_frame) {
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 dr: get frame holder failed\n");
+            return false;
+        }
+        ctx->decoder_dr_frame = frame;
+    }
+
+    if (ff_get_buffer(avctx, ctx->decoder_dr_frame, 0) != 0)
+        return false;
+
+    if (check_buf) {
+        uint8_t *buffers[4] = {NULL};
+        int strides[4] = {0};
+        int steps[4] = {0};
+        uint8_t **dr_buffers = ctx->decoder_dr_frame->data;
+        int *dr_strides = ctx->decoder_dr_frame->linesize;
+        int dr_pitch = 0;
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+        if (!desc) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 dr: unknown pix format %d\n", avctx->pix_fmt);
+            goto check_fail;
+        }
+
+        // check buffer count
+        for (int i = 1; i < AV_NUM_DATA_POINTERS; i++) {
+            if (ctx->decoder_dr_frame->buf[i]) {
+                av_log(avctx, AV_LOG_ERROR, "vita_h264 dr: multi-buffer is not supported\n");
+                goto check_fail;
+            }
+        }
+
+        av_image_fill_max_pixsteps(steps, NULL, desc);
+        dr_pitch = dr_strides[0] / steps[0];
+
+        // check plane memory layout
+        av_image_fill_arrays(buffers, strides, dr_buffers[0],
+            avctx->pix_fmt, dr_pitch, ctx->frame_height, 1);
+        if (memcmp(buffers, dr_buffers, desc->nb_components * sizeof(buffers[0]))
+            || memcmp(strides, dr_strides, desc->nb_components * sizeof(strides[0]))) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 dr: illegal memory layout\n");
+            goto check_fail;
+        }
+    }
+
+    return true;
+
+check_fail:
+    av_frame_unref(ctx->decoder_dr_frame);
+    return false;
+}
+
 static void do_init(AVCodecContext *avctx)
 {
     int ret = 0;
@@ -649,10 +706,15 @@ static void do_init(AVCodecContext *avctx)
         goto fail;
     }
 
-    ouput_buf_size = av_image_get_buffer_size(avctx->pix_fmt, ctx->frame_width, ctx->frame_height, 1);
-    if (ouput_buf_size <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid output buffer size\n");
-        goto fail;
+    if (ctx->option_dr) {
+        if (!prepare_dr_frame(avctx, true))
+            goto fail;
+    } else {
+        ouput_buf_size = av_image_get_buffer_size(avctx->pix_fmt, ctx->frame_pitch, ctx->frame_height, 1);
+        if (ouput_buf_size <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "vita_h264 init: invalid output buffer size\n");
+            goto fail;
+        }
     }
 
     sizes[VITA_DECODE_BUFFER_TYPE_FRAME] = di.frameMemSize;
@@ -672,6 +734,7 @@ static void do_init(AVCodecContext *avctx)
     }
     ctx->flags |= VITA_DECODE_VIDEO_FLAG_DONE_AVC_LIB;
 
+    memset(&ctx->decoder_ctrl, 0, sizeof(SceAvcdecCtrl));
     ctx->decoder_ctrl.frameBuf.pBuf = ptrs[VITA_DECODE_BUFFER_TYPE_FRAME];
     ctx->decoder_ctrl.frameBuf.size = sizes[VITA_DECODE_BUFFER_TYPE_FRAME];
     ret = sceAvcdecCreateDecoderInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctx->decoder_ctrl, &qdi);
@@ -691,9 +754,8 @@ fail:
 static av_cold int vita_init(AVCodecContext *avctx)
 {
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
-    memset(ctx, 0, sizeof(VitaDecodeContextImpl));
     avctx->pix_fmt = resolve_user_request_format(avctx->pix_fmt);
-    ctx->flags |= VITA_DECODE_VIDEO_FLAG_INIT_POSTPONED;
+    ctx->flags = VITA_DECODE_VIDEO_FLAG_INIT_POSTPONED;
     do_parse_meta_data_raw(avctx, avctx->extradata, avctx->extradata_size, false);
     return 0;
 }
@@ -758,33 +820,31 @@ static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPict
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
 
     int ret = 0;
-    int max_steps[4] = {0};
-    int ls_list[4] = {0};
-    uint8_t *src_list[4] = {0};
+    int steps[4] = {0};
+    int strides[4] = {0};
+    uint8_t *buffers[4] = {NULL};
     uint32_t crop_x = 0;
     uint32_t crop_y = 0;
     uint8_t *pixels = NULL;
-    AVRational *time_base = select_time_base(avctx);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
     if (!desc)
         return false;
 
-    av_image_fill_max_pixsteps(max_steps, NULL, desc);
+    av_image_fill_max_pixsteps(steps, NULL, desc);
     crop_x = FFMIN(p->frame.frameCropLeftOffset, p->frame.framePitch - ctx->h264_width);
     crop_y = FFMIN(p->frame.frameCropTopOffset, p->frame.frameHeight - ctx->h264_height);
-    pixels = (uint8_t*) ctx->decoder_ptr_output + (crop_x + crop_y * p->frame.framePitch) * max_steps[0];
+    pixels = (uint8_t*) ctx->decoder_ptr_output + (crop_x + crop_y * p->frame.framePitch) * steps[0];
 
-    ret = av_image_fill_arrays(src_list, ls_list,
+    ret = av_image_fill_arrays(buffers, strides,
         pixels, avctx->pix_fmt, 
         p->frame.framePitch, p->frame.frameHeight, 1);
     if (ret <= 0)
         return false;
 
     av_image_copy(frame->data, frame->linesize, 
-        (const uint8_t**) src_list, (const int*) ls_list,
+        (const uint8_t**) buffers, (const int*) strides,
         avctx->pix_fmt, avctx->width, avctx->height);
 
-    frame->pts = to_timestamp_ff(time_base, &p->info.pts);
     return true;
 }
 
@@ -796,6 +856,7 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     SceAvcdecPicture p = {0};
     SceAvcdecPicture *pp[] = {&p};
     SceAvcdecArrayPicture ap = {0};
+    void *frame_output = NULL;
 
     // is it a corner use case?
     // some developers may send SPS and PPS through side data,
@@ -807,7 +868,7 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
 
     // it's necessary to probe SPS or PPS for every packet
     // 1. there is no extradata being passed when decoding a raw h264 stream with a parser
-    // 2. the new SPS or PPS only appears in packet when decoding a mixed h264 stream
+    // 2. the new SPS or PPS only appears in packets when decoding a mixed h264 stream
     //    containing different-sized video data
     do_parse_meta_data_probed(avctx, avpkt);
 
@@ -817,16 +878,19 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     }
 
     // reject any decode invocations if init failed
-    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY)) {
+    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY))
         return AVERROR_UNKNOWN;
-    }
+
+    frame_output = ctx->option_dr
+        ? ctx->decoder_dr_frame->data[0]
+        : ctx->decoder_ptr_output;
 
     p.size = sizeof(SceAvcdecPicture);
     p.frame.pixelType = ctx->frame_format->sce_format;
     p.frame.framePitch = ctx->frame_pitch;
     p.frame.frameWidth = ctx->frame_width;
     p.frame.frameHeight = ctx->frame_height;
-    p.frame.pPicture[0] = ctx->decoder_ptr_output;
+    p.frame.pPicture[0] = frame_output;
 
     ap.numOfElm = 1;
     ap.pPicture = pp;
@@ -859,26 +923,51 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
         }
     }
 
-    if (ap.numOfOutput) {
+    if (!ap.numOfOutput)
+        goto done;
+
+    if (ctx->option_dr) {
+        av_frame_unref(frame);
+        av_frame_move_ref(frame, ctx->decoder_dr_frame);
+        ff_decode_frame_props(avctx, frame);
+        if (!prepare_dr_frame(avctx, false))
+            return AVERROR_UNKNOWN;
+    } else {
         ret = ff_get_buffer(avctx, frame, 0);
         if (ret < 0)
             return ret;
 
-        if (do_output_frame(avctx, frame, &p)) {
-            *got_frame = 1;
-        } else {
+        if (!do_output_frame(avctx, frame, &p)) {
             av_frame_unref(frame);
             av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: output frame failed\n");
+            return AVERROR_UNKNOWN;
         }
     }
 
+    *got_frame = 1;
+    frame->pts = to_timestamp_ff(select_time_base(avctx), &p.info.pts);
+
+done:
     // the decoder has consumed the all data input
     return 0;
 }
 
+static const AVOption vita_h264_options[] = {
+    { 
+        "vita_h264_dr", 
+        "Export pixel data to CDRAM-backed AVFrame",
+        offsetof(VitaDecodeContext, impl) + offsetof(VitaDecodeContextImpl, option_dr),
+        AV_OPT_TYPE_BOOL, {.i64 = 0},
+        0, 1,
+        AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM,
+    },
+    { NULL },
+};
+
 static const AVClass vita_h264_dec_class = {
     .class_name     = "vita_h264_dec",
     .item_name      = av_default_item_name,
+    .option         = vita_h264_options,
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
