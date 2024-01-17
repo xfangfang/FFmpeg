@@ -768,11 +768,16 @@ static av_cold int vita_close(AVCodecContext *avctx)
 
 static void vita_flush(AVCodecContext *avctx)
 {
+    int ret = 0;
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
-    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY))
+    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY)) {
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 flush: decoder not ready\n");
         return;
+    }
 
-    sceAvcdecDecodeFlush(&ctx->decoder_ctrl);
+    ret = sceAvcdecDecodeFlush(&ctx->decoder_ctrl);
+    if (ret)
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 flush: failed 0x%x\n", ret);
 }
 
 static AVRational* select_time_base(AVCodecContext *avctx)
@@ -878,8 +883,10 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     }
 
     // reject any decode invocations if init failed
-    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY))
+    if (!(ctx->flags & VITA_DECODE_VIDEO_FLAG_DECODER_READY)) {
+        av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: decoder not ready\n");
         return AVERROR_UNKNOWN;
+    }
 
     frame_output = ctx->option_dr
         ? ctx->decoder_dr_frame->data[0]
