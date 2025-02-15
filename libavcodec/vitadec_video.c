@@ -5,6 +5,7 @@
 
 #include <psp2/videodec.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr/thread.h>
 
 #include "decode.h"
 #include "avcodec.h"
@@ -49,6 +50,7 @@ SceInt32 sceAvcdecQueryDecoderMemSizeInternal(SceVideodecType type, SceAvcdecQue
 SceInt32 sceVideodecInitLibraryWithUnmapMemInternal(SceVideodecType type, SceVideodecCtrl *ctrl, SceVideodecQueryInitInfo *query);
 SceInt32 sceAvcdecCreateDecoderInternal(SceVideodecType type, SceAvcdecCtrl *decoder, SceAvcdecQueryDecoderInfo *query);
 
+SceInt32 sceAvcdecDecodeAvailableSize(SceAvcdecCtrl *decoder);
 SceInt32 sceAvcdecDecodeAuInternal(SceAvcdecCtrl *decoder, SceAvcdecAu *au, SceInt32 *pic);
 SceInt32 sceAvcdecDecodeGetPictureWithWorkPictureInternal(SceAvcdecCtrl *decoder, SceAvcdecArrayPicture *a1, SceAvcdecArrayPicture *a2, SceInt32 *pic);
 
@@ -859,6 +861,7 @@ static bool do_output_frame(AVCodecContext *avctx, AVFrame *frame, SceAvcdecPict
 static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AVPacket *avpkt)
 {
     int ret = 0;
+    int buffer_full = 0;
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
 
     SceAvcdecPicture p = {0};
@@ -913,23 +916,33 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
         }
     } else {
         SceAvcdecAu au = {0};
-        SceAvcdecArrayPicture wap = {0};
         AVRational *time_base = select_time_base(avctx);
-        au.es.pBuf = avpkt->data;
-        au.es.size = avpkt->size;
         to_timestamp_vita(avpkt->pts, time_base,  &au.pts);
         to_timestamp_vita(avpkt->dts, time_base, &au.dts);
 
-        ret = sceAvcdecDecodeAuInternal(&ctx->decoder_ctrl, &au, &ctx->decoder_picture_int);
-        if (ret < 0) {
+decode:
+        ret = sceAvcdecDecodeAvailableSize(&ctx->decoder_ctrl);
+        if (ret < avpkt->size) {
+            buffer_full = 1;
+            au.es.pBuf = NULL;
+            au.es.size = 0;
+        } else {
+            buffer_full = 0;
+            au.es.pBuf = avpkt->data;
+            au.es.size = avpkt->size;
+        }
+
+        ret = sceAvcdecDecode(&ctx->decoder_ctrl, &au, &ap);
+        if (ret == SCE_AVCDEC_ERROR_ES_BUFFER_FULL) {
+            buffer_full = 1;
+        } else if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: decode au failed 0x%x\n", ret);
             return AVERROR_UNKNOWN;
         }
 
-        ret = sceAvcdecDecodeGetPictureWithWorkPictureInternal(&ctx->decoder_ctrl, &ap, &wap, &ctx->decoder_picture_int);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "vita_h264 decode: decode work picture failed 0x%x\n", ret);
-            return AVERROR_UNKNOWN;
+        if (buffer_full && ap.numOfOutput == 0) {
+            sceKernelDelayThread(100);
+            goto decode;
         }
     }
 
@@ -958,8 +971,7 @@ static int vita_decode(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AV
     frame->pts = to_timestamp_ff(select_time_base(avctx), &p.info.pts);
 
 done:
-    // the decoder has consumed the all data input
-    return 0;
+    return buffer_full ? AVERROR_BUFFER_TOO_SMALL : 0;
 }
 
 static const AVOption vita_h264_options[] = {
@@ -973,6 +985,79 @@ static const AVOption vita_h264_options[] = {
     },
     { NULL },
 };
+static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame)
+{
+    AVCodecInternal   *avci = avctx->internal;
+    AVPacket     *const pkt = avci->in_pkt;
+    const FFCodec *const codec = ffcodec(avctx->codec);
+    int got_frame, actual_got_frame;
+    int ret;
+
+    if (!pkt->data && !avci->draining) {
+        av_packet_unref(pkt);
+        ret = ff_decode_get_packet(avctx, pkt);
+        if (ret < 0 && ret != AVERROR_EOF)
+            return ret;
+    }
+
+    if (avci->draining_done) {
+        return AVERROR_EOF;
+    }
+
+    got_frame = 0;
+
+    ret = vita_decode(avctx, frame, &got_frame, pkt);
+    if (ret == AVERROR_BUFFER_TOO_SMALL)
+        return 0;
+
+    if (!(codec->caps_internal & FF_CODEC_CAP_SETS_PKT_DTS))
+        frame->pkt_dts = pkt->dts;
+
+    if(!avctx->has_b_frames)
+        frame->pkt_pos = pkt->pos;
+
+    actual_got_frame = got_frame;
+
+    if (frame->flags & AV_FRAME_FLAG_DISCARD)
+        got_frame = 0;
+
+    if (!got_frame)
+        av_frame_unref(frame);
+
+    if (avci->draining && !actual_got_frame) {
+        if (ret < 0) {
+            int nb_errors_max = 21;
+
+            if (avci->nb_draining_errors++ >= nb_errors_max) {
+                av_log(avctx, AV_LOG_ERROR, "Too many errors when draining, this is a bug. "
+                       "Stop draining and force EOF.\n");
+                avci->draining_done = 1;
+                ret = AVERROR_BUG;
+            }
+        } else {
+            avci->draining_done = 1;
+        }
+    }
+
+    av_packet_unref(pkt);
+
+    if (got_frame)
+        av_assert0(frame->buf[0]);
+
+    return ret < 0 ? ret : 0;
+}
+
+static int decode_simple_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    int ret;
+    while (!frame->buf[0]) {
+        ret = decode_simple_internal(avctx, frame);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
 
 static const AVClass vita_h264_dec_class = {
     .class_name     = "vita_h264_dec",
@@ -990,7 +1075,7 @@ const FFCodec ff_h264_vita_decoder = {
     .init               = vita_init,
     .close              = vita_close,
     .flush              = vita_flush,
-    FF_CODEC_DECODE_CB(vita_decode),
+    FF_CODEC_RECEIVE_FRAME_CB(decode_simple_receive_frame),
     .bsfs               = "h264_mp4toannexb",
     .p.priv_class       = &vita_h264_dec_class,
     .p.capabilities     = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE,
