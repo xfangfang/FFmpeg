@@ -24,10 +24,11 @@
 
 // non-exported internal API
 
-typedef struct SceVideodecCtrl {
-    uint8_t reserved[24];
-    SceUIntVAddr vaddr;
-    SceUInt32 size;
+typedef struct SceVideodecCtrl{
+    SceAvcdecBuf memBuf;
+    SceUID memBufUid;
+    SceUIntVAddr vaContext;
+    SceUInt32 contextSize;
 } SceVideodecCtrl;
 
 SceInt32 sceAvcdecDecodeFlush(SceAvcdecCtrl *ctrl);
@@ -69,6 +70,8 @@ SceInt32 sceAvcdecDecodeGetPictureWithWorkPictureInternal(SceAvcdecCtrl *decoder
 #define VITA_DECODE_MEM_BLOCK_NAME              "ffmpeg_vdec"
 #define VITA_DECODE_MEM_BLOCK_TYPE              SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW
 #define VITA_DECODE_MEM_BLOCK_SIZE_ALIGN        (256 * 1024)
+// #define VITA_DECODE_MEM_BLOCK_TYPE              SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW
+// #define VITA_DECODE_MEM_BLOCK_SIZE_ALIGN        (1024 * 1024)
 #define VITA_DECODE_TIMESTAMP_UNIT_BASE         (90 * 1000)
 #define VITA_DECODE_TIMESTAMP_VOID              (0xffffffff)
 
@@ -230,8 +233,8 @@ static const VitaDecodeBufferDescriptor vita_decode_buffer_descriptors[VITA_DECO
         0,
         offsetof(VitaDecodeContextImpl, decoder_vaddr_codec),
         offsetof(VitaDecodeContextImpl, decoder_mb_codec_unmap),
-        0,
         (256 * 1024),
+        0,
     },
 };
 
@@ -245,7 +248,7 @@ static bool do_mem_alloc(VitaDecodeBufferAllocParams *p)
     SceKernelAllocMemBlockOpt opt = {0};
     SceKernelAllocMemBlockOpt *arg = NULL;
 
-    if (p->alignment) {
+    if (VITA_DECODE_MEM_BLOCK_TYPE != SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW && p->alignment) {
         arg = &opt;
         arg->size = sizeof(SceKernelAllocMemBlockOpt);
         arg->attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
@@ -270,7 +273,7 @@ fail:
     return false;
 }
 
-static void do_mem_free(VitaDecodeBufferFreeParams *p)
+static void __attribute__((optimize("no-optimize-sibling-calls"))) do_mem_free(VitaDecodeBufferFreeParams *p)
 {
     sceKernelFreeMemBlock(*p->mb);
 }
@@ -285,7 +288,7 @@ static bool do_unmap_open(VitaDecodeBufferAllocParams *p)
     return true;
 }
 
-static void do_unmap_close(VitaDecodeBufferFreeParams *p)
+static void __attribute__((optimize("no-optimize-sibling-calls"))) do_unmap_close(VitaDecodeBufferFreeParams *p)
 {
     sceCodecEngineCloseUnmapMemBlock(*p->mb);
 }
@@ -302,7 +305,7 @@ static bool do_vaddr_alloc(VitaDecodeBufferAllocParams *p)
     return true;
 }
 
-static void do_vaddr_free(VitaDecodeBufferFreeParams *p)
+static void __attribute__((optimize("no-optimize-sibling-calls"))) do_vaddr_free(VitaDecodeBufferFreeParams *p)
 {
     SceUID *unmap = p->ref;
     SceUIntVAddr *vaddr = p->ptr;
@@ -725,8 +728,8 @@ static void do_init(AVCodecContext *avctx)
     if (!buffers_alloc(avctx, sizes, ptrs))
         goto fail;
 
-    ctrl.vaddr = ctx->decoder_vaddr_codec;
-    ctrl.size = codec_buf_size;
+    ctrl.vaContext = ctx->decoder_vaddr_codec;
+    ctrl.contextSize = codec_buf_size;
     ret = sceVideodecInitLibraryWithUnmapMemInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, &ctrl, &init);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "vita_h264 init: init library failed 0x%x\n", ret);
