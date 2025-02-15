@@ -9,6 +9,7 @@
 
 #include "decode.h"
 #include "avcodec.h"
+#include "hwconfig.h"
 #include "internal.h"
 #include "codec_internal.h"
 
@@ -171,6 +172,8 @@ static void buffers_free(AVCodecContext *avctx);
 
 
 static const VitaDecodeFormatDescriptor vita_decode_format_descriptors[] = {
+    { AV_PIX_FMT_VITA_YUV420P, SCE_AVCDEC_PIXELFORMAT_YUV420_RASTER, 32 },
+    { AV_PIX_FMT_VITA_NV12, SCE_AVCDEC_PIXELFORMAT_YUV420_PACKED_RASTER, 16 },
     { AV_PIX_FMT_RGBA, SCE_AVCDEC_PIXELFORMAT_RGBA8888, 16 },
     { AV_PIX_FMT_BGR565LE, SCE_AVCDEC_PIXELFORMAT_RGBA565, 16 },
     { AV_PIX_FMT_BGR555LE, SCE_AVCDEC_PIXELFORMAT_RGBA5551, 16 },
@@ -760,6 +763,7 @@ static av_cold int vita_init(AVCodecContext *avctx)
 {
     VitaDecodeContextImpl *ctx = get_ctx_impl(avctx);
     avctx->pix_fmt = resolve_user_request_format(avctx->pix_fmt);
+    ctx->option_dr = avctx->pix_fmt == AV_PIX_FMT_VITA_YUV420P || avctx->pix_fmt == AV_PIX_FMT_VITA_NV12;
     ctx->flags = VITA_DECODE_VIDEO_FLAG_INIT_POSTPONED;
     do_parse_meta_data_raw(avctx, avctx->extradata, avctx->extradata_size, false);
     return 0;
@@ -974,17 +978,6 @@ done:
     return buffer_full ? AVERROR_BUFFER_TOO_SMALL : 0;
 }
 
-static const AVOption vita_h264_options[] = {
-    { 
-        "vita_h264_dr", 
-        "Export pixel data to CDRAM-backed AVFrame",
-        offsetof(VitaDecodeContext, impl) + offsetof(VitaDecodeContextImpl, option_dr),
-        AV_OPT_TYPE_BOOL, {.i64 = 0},
-        0, 1,
-        AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM,
-    },
-    { NULL },
-};
 static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame)
 {
     AVCodecInternal   *avci = avctx->internal;
@@ -1062,7 +1055,7 @@ static int decode_simple_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 static const AVClass vita_h264_dec_class = {
     .class_name     = "vita_h264_dec",
     .item_name      = av_default_item_name,
-    .option         = vita_h264_options,
+    .option         = NULL,
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
@@ -1081,4 +1074,9 @@ const FFCodec ff_h264_vita_decoder = {
     .p.capabilities     = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE,
     .caps_internal      = FF_CODEC_CAP_NOT_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
     .p.wrapper_name     = "vita",
+    .hw_configs         = (const AVCodecHWConfigInternal *const []) {
+        HW_CONFIG_INTERNAL(VITA_NV12),
+        HW_CONFIG_INTERNAL(VITA_YUV420P),
+        NULL
+    },
 };
